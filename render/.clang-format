@@ -1,0 +1,32 @@
+Language:        Cpp
+BasedOnStyle:    LLVM
+Standard:        c++20
+
+IndentWidth:     4
+TabWidth:        4
+UseTab:          Never
+AccessModifierOffset: -4
+NamespaceIndentation: None
+CompactNamespaces: true
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+
+ColumnLimit:     120
+BinPackArguments: false
+BinPackParameters: false
+
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortBlocksOnASingleLine: Empty
+
+InsertBraces: true
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: false
+
+PointerAlignment: Left
+
+SortIncludes: CaseInsensitive
+FixNamespaceComments: true
+
+BreakBeforeConceptDeclarations: true
+Cpp11BracedListStyle: true

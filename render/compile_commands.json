@@ -1,0 +1,6 @@
+[
+{
+  "directory": "/Users/aska/Development/render-server/render",
+  "arguments": ["/usr/bin/clang++", "-c", "-Qunused-arguments", "-fvisibility=hidden", "-fvisibility-inlines-hidden", "-O3", "-std=c++23", "-DWEBRTC_MAC", "-DWEBRTC_POSIX", "-framework", "CoreAudio", "-framework", "AudioToolbox", "-framework", "CoreFoundation", "-framework", "CoreGraphics", "-framework", "Foundation", "-I", "/Users/aska/Development/webrtc-checkout/src", "-I", "/Users/aska/Development/webrtc-checkout/src/third_party/abseil-cpp", "-DNDEBUG", "-o", "build/.objs/render/macosx/arm64/release/src/main.cpp.o", "src/main.cpp"],
+  "file": "src/main.cpp"
+}]
