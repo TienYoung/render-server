@@ -1,0 +1,25 @@
+@server_HostAddress = http://localhost:5040
+@sessionId = replace-with-session-id
+
+### 创建会话；响应中的 sessionId 填到上面的变量
+POST {{server_HostAddress}}/api/signaling/sessions
+
+### 用 SSE 持续接收后端发起的 offer 和 ICE（保持连接）
+GET {{server_HostAddress}}/api/signaling/sessions/{{sessionId}}/events?after=0
+Accept: text/event-stream
+
+### 前端响应 answer
+POST {{server_HostAddress}}/api/signaling/sessions/{{sessionId}}/answer
+Content-Type: application/json
+
+{
+  "sdp": "v=0\r\no=client 1 1 IN IP4 127.0.0.1\r\ns=mock-answer\r\nt=0 0"
+}
+
+### 前端发送 ICE
+POST {{server_HostAddress}}/api/signaling/sessions/{{sessionId}}/ice
+Content-Type: application/json
+
+{
+  "candidate": "candidate:client-1 1 udp 2122260223 192.0.2.2 50001 typ host"
+}
