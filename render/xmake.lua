@@ -3,7 +3,7 @@ set_version("0.0.1")
 
 add_rules("mode.debug", "mode.release")
 
-set_languages("cxx23")
+set_languages("cxx20")
 
 target("render")
     set_kind("binary")
@@ -18,7 +18,10 @@ target("render")
         webrtc_root,
         webrtc_root .. "/third_party/abseil-cpp"
     )
-    add_frameworks("CoreAudio", "AudioToolbox", "CoreFoundation", "CoreGraphics", "Foundation")
+    add_includedirs(
+        "third_party/metal-cpp"
+    )
+    add_frameworks("Foundation", "Metal")
     add_linkdirs(webrtc_root .. "/out/Debug/obj")
 
     add_links("webrtc")
