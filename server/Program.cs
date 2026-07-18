@@ -1,8 +1,7 @@
-using System.Collections.Concurrent;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
-Console.WriteLine("正在启动 HTTP signaling server...");
+Console.WriteLine("Starting fixed-role HTTP/SSE signaling server...");
 var builder = WebApplication.CreateSlimBuilder(args);
 
 builder.Services.ConfigureHttpJsonOptions(options =>
@@ -11,37 +10,58 @@ builder.Services.ConfigureHttpJsonOptions(options =>
 });
 
 var app = builder.Build();
-var sessions = new ConcurrentDictionary<string, SignalingSession>();
+var hub = new SignalingHub();
 
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
 var signaling = app.MapGroup("/api/signaling");
 
-signaling.MapPost("/sessions", () =>
+// Render sends offer and ICE messages to the viewer over HTTP.
+signaling.MapPost("/render/offer", (SdpRequest request) =>
 {
-    var session = SignalingSession.Create();
-    sessions[session.Id] = session;
-
-    Log(session.Id, "server", "创建会话并发起 offer");
-    session.Add("offer", "server", "v=0\r\no=server 1 1 IN IP4 127.0.0.1\r\ns=mock-offer\r\nt=0 0");
-
-    // 这些只是用来演示信令交换的文本，不会交给 RTCPeerConnection。
-    session.Add("ice", "server", "candidate:server-1 1 udp 2122260223 192.0.2.1 50000 typ host");
-    session.Add("ice", "server", "candidate:server-2 1 udp 1686052607 198.51.100.1 3478 typ srflx");
-    Log(session.Id, "server", "已生成 2 个模拟 ICE candidate");
-
-    return Results.Ok(new SessionCreated(session.Id));
+    hub.BeginOffer(request.Sdp);
+    Log("render", "sent offer", request.Sdp);
+    return Results.NoContent();
 });
 
-signaling.MapGet("/sessions/{id}/events", async (HttpContext context, string id, long? after) =>
+signaling.MapPost("/render/ice", (IceCandidateRequest request) =>
 {
-    if (!sessions.TryGetValue(id, out var session))
-    {
-        context.Response.StatusCode = StatusCodes.Status404NotFound;
-        return;
-    }
+    hub.SendToViewer("ice", "render", request.Candidate);
+    Log("render", "sent ICE", request.Candidate);
+    return Results.NoContent();
+});
 
+// Render receives only viewer answer and ICE messages from this SSE stream.
+signaling.MapGet("/render/events", (HttpContext context, long? after) =>
+    StreamEvents(context, after, hub.WaitForRenderEventsAfterAsync));
+
+// Viewer sends answer and ICE messages to Render over HTTP.
+signaling.MapPost("/viewer/answer", (SdpRequest request) =>
+{
+    hub.SendToRender("answer", "viewer", request.Sdp);
+    Log("viewer", "sent answer", request.Sdp);
+    return Results.NoContent();
+});
+
+signaling.MapPost("/viewer/ice", (IceCandidateRequest request) =>
+{
+    hub.SendToRender("ice", "viewer", request.Candidate);
+    Log("viewer", "sent ICE", request.Candidate);
+    return Results.NoContent();
+});
+
+// Viewer receives only Render offer and ICE messages from this SSE stream.
+signaling.MapGet("/viewer/events", (HttpContext context, long? after) =>
+    StreamEvents(context, after, hub.WaitForViewerEventsAfterAsync));
+
+app.Run();
+
+static async Task StreamEvents(
+    HttpContext context,
+    long? after,
+    Func<long, CancellationToken, Task<SignalEvent[]>> waitForEvents)
+{
     context.Response.Headers.CacheControl = "no-cache";
     context.Response.Headers.Append("X-Accel-Buffering", "no");
     context.Response.ContentType = "text/event-stream";
@@ -51,6 +71,7 @@ signaling.MapGet("/sessions/{id}/events", async (HttpContext context, string id,
     {
         lastSequence = lastEventId;
     }
+
     await context.Response.WriteAsync("retry: 1000\n\n", context.RequestAborted);
     await context.Response.Body.FlushAsync(context.RequestAborted);
 
@@ -58,11 +79,13 @@ signaling.MapGet("/sessions/{id}/events", async (HttpContext context, string id,
     {
         while (!context.RequestAborted.IsCancellationRequested)
         {
-            var events = await session.WaitForEventsAfterAsync(lastSequence, context.RequestAborted);
+            var events = await waitForEvents(lastSequence, context.RequestAborted);
             foreach (var signalEvent in events)
             {
                 var json = JsonSerializer.Serialize(signalEvent, AppJsonSerializerContext.Default.SignalEvent);
-                await context.Response.WriteAsync($"id: {signalEvent.Sequence}\nevent: signal\ndata: {json}\n\n", context.RequestAborted);
+                await context.Response.WriteAsync(
+                    $"id: {signalEvent.Sequence}\nevent: signal\ndata: {json}\n\n",
+                    context.RequestAborted);
                 lastSequence = signalEvent.Sequence;
             }
 
@@ -71,58 +94,72 @@ signaling.MapGet("/sessions/{id}/events", async (HttpContext context, string id,
     }
     catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
     {
-        // 浏览器关闭 EventSource 时正常结束连接。
+        // End normally when the SSE client disconnects.
     }
-});
+}
 
-signaling.MapPost("/sessions/{id}/answer", (string id, AnswerRequest request) =>
-{
-    if (!sessions.TryGetValue(id, out var session))
-    {
-        return Results.NotFound();
-    }
+static void Log(string sender, string action, string payload) =>
+    Console.WriteLine(
+        "[{0:HH:mm:ss}] [{1}] {2}: {3}",
+        DateTimeOffset.Now,
+        sender,
+        action,
+        payload.Replace("\r", "").Replace("\n", " | "));
 
-    session.Add("answer", "client", request.Sdp);
-    Log(id, "client", $"收到 answer: {request.Sdp.Replace("\r", "").Replace("\n", " | ")}");
-    return Results.NoContent();
-});
-
-signaling.MapPost("/sessions/{id}/ice", (string id, IceCandidateRequest request) =>
-{
-    if (!sessions.TryGetValue(id, out var session))
-    {
-        return Results.NotFound();
-    }
-
-    session.Add("ice", "client", request.Candidate);
-    Log(id, "client", $"收到 ICE candidate: {request.Candidate}");
-    return Results.NoContent();
-});
-
-app.Run();
-
-static void Log(string sessionId, string sender, string message) =>
-    Console.WriteLine("[{0:HH:mm:ss}] [{1}] [{2}] {3}", DateTimeOffset.Now, sessionId, sender, message);
-
-public sealed class SignalingSession
+public sealed class SignalingHub
 {
     private readonly object gate = new();
-    private readonly List<SignalEvent> events = [];
-    private TaskCompletionSource eventsChanged = NewEventsChangedSource();
+    private readonly List<SignalEvent> viewerEvents = [];
+    private readonly List<SignalEvent> renderEvents = [];
+    private TaskCompletionSource viewerEventsChanged = NewEventsChangedSource();
+    private TaskCompletionSource renderEventsChanged = NewEventsChangedSource();
     private long sequence;
 
-    private SignalingSession(string id) => Id = id;
+    public void BeginOffer(string sdp)
+    {
+        TaskCompletionSource viewerChanged;
+        TaskCompletionSource renderChanged;
 
-    public string Id { get; }
+        lock (gate)
+        {
+            // Only one Render-to-Viewer pair is supported. A new offer starts a new negotiation.
+            viewerEvents.Clear();
+            renderEvents.Clear();
+            viewerEvents.Add(new SignalEvent(++sequence, "offer", "render", sdp, DateTimeOffset.UtcNow));
 
-    public static SignalingSession Create() => new(Guid.NewGuid().ToString("N")[..8]);
+            viewerChanged = viewerEventsChanged;
+            renderChanged = renderEventsChanged;
+            viewerEventsChanged = NewEventsChangedSource();
+            renderEventsChanged = NewEventsChangedSource();
+        }
 
-    public void Add(string type, string sender, string payload)
+        viewerChanged.TrySetResult();
+        renderChanged.TrySetResult();
+    }
+
+    public void SendToViewer(string type, string sender, string payload) =>
+        Add(viewerEvents, ref viewerEventsChanged, type, sender, payload);
+
+    public void SendToRender(string type, string sender, string payload) =>
+        Add(renderEvents, ref renderEventsChanged, type, sender, payload);
+
+    public Task<SignalEvent[]> WaitForViewerEventsAfterAsync(long after, CancellationToken cancellationToken) =>
+        WaitForEventsAfterAsync(viewerEvents, () => viewerEventsChanged.Task, after, cancellationToken);
+
+    public Task<SignalEvent[]> WaitForRenderEventsAfterAsync(long after, CancellationToken cancellationToken) =>
+        WaitForEventsAfterAsync(renderEvents, () => renderEventsChanged.Task, after, cancellationToken);
+
+    private void Add(
+        List<SignalEvent> destination,
+        ref TaskCompletionSource eventsChanged,
+        string type,
+        string sender,
+        string payload)
     {
         TaskCompletionSource changed;
         lock (gate)
         {
-            events.Add(new SignalEvent(++sequence, type, sender, payload, DateTimeOffset.UtcNow));
+            destination.Add(new SignalEvent(++sequence, type, sender, payload, DateTimeOffset.UtcNow));
             changed = eventsChanged;
             eventsChanged = NewEventsChangedSource();
         }
@@ -130,20 +167,24 @@ public sealed class SignalingSession
         changed.TrySetResult();
     }
 
-    public async Task<SignalEvent[]> WaitForEventsAfterAsync(long after, CancellationToken cancellationToken)
+    private async Task<SignalEvent[]> WaitForEventsAfterAsync(
+        List<SignalEvent> source,
+        Func<Task> getChangedTask,
+        long after,
+        CancellationToken cancellationToken)
     {
         while (true)
         {
             Task changed;
             lock (gate)
             {
-                var available = events.Where(item => item.Sequence > after).ToArray();
+                var available = source.Where(item => item.Sequence > after).ToArray();
                 if (available.Length > 0)
                 {
                     return available;
                 }
 
-                changed = eventsChanged.Task;
+                changed = getChangedTask();
             }
 
             await changed.WaitAsync(cancellationToken);
@@ -154,14 +195,12 @@ public sealed class SignalingSession
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 }
 
-public sealed record SessionCreated(string SessionId);
-public sealed record AnswerRequest(string Sdp);
+public sealed record SdpRequest(string Sdp);
 public sealed record IceCandidateRequest(string Candidate);
 public sealed record SignalEvent(long Sequence, string Type, string Sender, string Payload, DateTimeOffset CreatedAt);
 
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
-[JsonSerializable(typeof(SessionCreated))]
-[JsonSerializable(typeof(AnswerRequest))]
+[JsonSerializable(typeof(SdpRequest))]
 [JsonSerializable(typeof(IceCandidateRequest))]
-[JsonSerializable(typeof(SignalEvent[]))]
+[JsonSerializable(typeof(SignalEvent))]
 internal partial class AppJsonSerializerContext : JsonSerializerContext;

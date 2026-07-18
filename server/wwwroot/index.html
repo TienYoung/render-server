@@ -3,28 +3,25 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>HTTP Signaling Demo</title>
+  <title>Viewer Signaling Peer</title>
   <style>
     body { max-width: 900px; margin: 32px auto; padding: 0 16px; font: 15px/1.6 ui-monospace, monospace; background: #111; color: #ddd; }
     h1 { font-size: 20px; }
-    button { padding: 8px 12px; font: inherit; cursor: pointer; }
-    #status { margin-left: 12px; color: #8fd; }
+    #status { color: #8fd; }
     #log { margin-top: 20px; padding: 16px; min-height: 360px; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid #555; background: #080808; }
-    .server { color: #8cf; }
-    .client { color: #fc8; }
+    .render { color: #8cf; }
+    .viewer { color: #fc8; }
     .system { color: #aaa; }
   </style>
 </head>
 <body>
-  <h1>最小 HTTP Signaling（无 WebRTC、无 WebSocket）</h1>
-  <button id="start">开始新的信令会话</button><span id="status">尚未开始</span>
+  <h1>Viewer Signaling Peer (no WebRTC, no WebSocket)</h1>
+  <div id="status">Connecting to SSE...</div>
   <div id="log" aria-live="polite"></div>
 
   <script>
     const logBox = document.querySelector('#log');
     const statusBox = document.querySelector('#status');
-    const startButton = document.querySelector('#start');
-    let generation = 0;
 
     function log(sender, message) {
       const line = document.createElement('div');
@@ -34,96 +31,54 @@
       console.log(`[${sender}] ${message}`);
     }
 
-    async function request(url, options) {
-      const response = await fetch(url, options);
+    async function post(url, body) {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body)
+      });
       if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-      return response.status === 204 ? null : response.json();
     }
 
-    async function startSession() {
-      const currentGeneration = ++generation;
-      startButton.disabled = true;
-      logBox.replaceChildren();
-      statusBox.textContent = '创建会话中…';
+    const eventSource = new EventSource('/api/signaling/viewer/events');
 
+    eventSource.onopen = () => {
+      statusBox.textContent = 'SSE connected. Waiting for Render offer/ICE.';
+      log('system', 'Connected to viewer SSE: GET /api/signaling/viewer/events');
+    };
+
+    eventSource.addEventListener('signal', async message => {
       try {
-        const { sessionId } = await request('/api/signaling/sessions', { method: 'POST' });
-        log('system', `会话 ${sessionId} 已创建；通过 SSE 接收服务端信令`);
-        statusBox.textContent = `会话：${sessionId}`;
+        const event = JSON.parse(message.data);
+        log(event.sender, `${event.type.toUpperCase()} → ${event.payload}`);
 
-        let answered = false;
-        let clientIceSent = false;
-        let confirmedClientIce = 0;
-        const eventSource = new EventSource(`/api/signaling/sessions/${sessionId}/events`);
+        if (event.type === 'offer' && event.sender === 'render') {
+          statusBox.textContent = 'Offer received. Sending answer/ICE.';
 
-        await new Promise((resolve, reject) => {
-          eventSource.addEventListener('signal', async message => {
-            try {
-              if (generation !== currentGeneration) {
-                eventSource.close();
-                resolve();
-                return;
-              }
+          const sdp = 'v=0\r\no=viewer 1 1 IN IP4 127.0.0.1\r\ns=mock-answer\r\nt=0 0';
+          await post('/api/signaling/viewer/answer', { sdp });
+          log('viewer', `ANSWER → ${sdp}`);
 
-              const event = JSON.parse(message.data);
-              log(event.sender, `${event.type.toUpperCase()} → ${event.payload}`);
+          for (const candidate of [
+            'candidate:viewer-1 1 udp 2122260223 192.0.2.2 50001 typ host',
+            'candidate:viewer-2 1 udp 1686052607 198.51.100.2 3479 typ srflx'
+          ]) {
+            await post('/api/signaling/viewer/ice', { candidate });
+            log('viewer', `ICE → ${candidate}`);
+          }
 
-              if (event.type === 'offer' && event.sender === 'server' && !answered) {
-                answered = true;
-                const sdp = 'v=0\r\no=client 1 1 IN IP4 127.0.0.1\r\ns=mock-answer\r\nt=0 0';
-                log('client', '收到 SSE offer，正在用 HTTP POST 返回模拟 answer');
-                await request(`/api/signaling/sessions/${sessionId}/answer`, {
-                  method: 'POST',
-                  headers: { 'content-type': 'application/json' },
-                  body: JSON.stringify({ sdp })
-                });
-              }
-
-              if (answered && !clientIceSent) {
-                clientIceSent = true;
-                for (const candidate of [
-                  'candidate:client-1 1 udp 2122260223 192.0.2.2 50001 typ host',
-                  'candidate:client-2 1 udp 1686052607 198.51.100.2 3479 typ srflx'
-                ]) {
-                  log('client', `通过 HTTP POST 发送 ICE → ${candidate}`);
-                  await request(`/api/signaling/sessions/${sessionId}/ice`, {
-                    method: 'POST',
-                    headers: { 'content-type': 'application/json' },
-                    body: JSON.stringify({ candidate })
-                  });
-                }
-              }
-
-              if (event.type === 'ice' && event.sender === 'client') {
-                confirmedClientIce++;
-              }
-
-              if (confirmedClientIce === 2) {
-                log('system', 'SSE 信令交换完成（仅交换文本，未创建 RTCPeerConnection）');
-                statusBox.textContent = `会话：${sessionId}（完成）`;
-                eventSource.close();
-                resolve();
-              }
-            } catch (error) {
-              eventSource.close();
-              reject(error);
-            }
-          });
-
-          eventSource.onerror = () => {
-            log('system', 'SSE 暂时断开，浏览器将自动重连');
-          };
-        });
+          statusBox.textContent = 'Answer/ICE sent. Waiting for more Render ICE.';
+        }
       } catch (error) {
-        log('system', `错误：${error.message}`);
-        statusBox.textContent = '失败';
-      } finally {
-        if (generation === currentGeneration) startButton.disabled = false;
+        log('system', `Failed to process signaling event: ${error.message}`);
+        statusBox.textContent = 'Signaling failed.';
       }
-    }
+    });
 
-    startButton.addEventListener('click', startSession);
-    startSession();
+    eventSource.onerror = () => {
+      statusBox.textContent = 'SSE disconnected. The browser is reconnecting...';
+      log('system', 'Viewer SSE disconnected');
+    };
   </script>
 </body>
 </html>

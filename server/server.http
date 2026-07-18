@@ -1,25 +1,41 @@
 @server_HostAddress = http://localhost:5040
-@sessionId = replace-with-session-id
 
-### 创建会话；响应中的 sessionId 填到上面的变量
-POST {{server_HostAddress}}/api/signaling/sessions
-
-### 用 SSE 持续接收后端发起的 offer 和 ICE（保持连接）
-GET {{server_HostAddress}}/api/signaling/sessions/{{sessionId}}/events?after=0
+### Render: open this SSE stream and wait for Viewer answer/ICE
+GET {{server_HostAddress}}/api/signaling/render/events
 Accept: text/event-stream
 
-### 前端响应 answer
-POST {{server_HostAddress}}/api/signaling/sessions/{{sessionId}}/answer
+### Render: send an offer; a new offer clears events from the previous negotiation
+POST {{server_HostAddress}}/api/signaling/render/offer
 Content-Type: application/json
 
 {
-  "sdp": "v=0\r\no=client 1 1 IN IP4 127.0.0.1\r\ns=mock-answer\r\nt=0 0"
+  "sdp": "v=0\r\no=render 1 1 IN IP4 127.0.0.1\r\ns=mock-offer\r\nt=0 0"
 }
 
-### 前端发送 ICE
-POST {{server_HostAddress}}/api/signaling/sessions/{{sessionId}}/ice
+### Render: send ICE; Viewer receives it from the Viewer SSE stream
+POST {{server_HostAddress}}/api/signaling/render/ice
 Content-Type: application/json
 
 {
-  "candidate": "candidate:client-1 1 udp 2122260223 192.0.2.2 50001 typ host"
+  "candidate": "candidate:render-1 1 udp 2122260223 192.0.2.1 50000 typ host"
+}
+
+### Viewer: open this SSE stream and wait for Render offer/ICE
+GET {{server_HostAddress}}/api/signaling/viewer/events
+Accept: text/event-stream
+
+### Viewer: send an answer; Render receives it from the Render SSE stream
+POST {{server_HostAddress}}/api/signaling/viewer/answer
+Content-Type: application/json
+
+{
+  "sdp": "v=0\r\no=viewer 1 1 IN IP4 127.0.0.1\r\ns=mock-answer\r\nt=0 0"
+}
+
+### Viewer: send ICE; Render receives it from the Render SSE stream
+POST {{server_HostAddress}}/api/signaling/viewer/ice
+Content-Type: application/json
+
+{
+  "candidate": "candidate:viewer-1 1 udp 2122260223 192.0.2.2 50001 typ host"
 }
