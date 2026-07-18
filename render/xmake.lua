@@ -1,15 +1,15 @@
 set_project("render")
 set_version("0.0.1")
 
-add_rules("mode.debug", "mode.release")
-
+set_toolchains("llvm")
 set_languages("cxx20")
+
+add_rules("mode.debug", "mode.release")
+-- add_rules("plugin.compile_commands.autoupdate", {outputdir = "."})
 
 target("render")
     set_kind("binary")
-    add_files("src/*.cpp")
-
-    set_toolchains("clang")
+    add_files("src/*.cpp") 
 
     add_defines("WEBRTC_MAC", "WEBRTC_POSIX")
 
@@ -94,4 +94,3 @@ target("render")
 --
 -- @endcode
 --
-
