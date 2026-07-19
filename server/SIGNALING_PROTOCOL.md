@@ -9,7 +9,9 @@ This protocol coordinates one Render peer with one Viewer peer. The roles are fi
 | Render | Offer and ICE candidates | Viewer answer and ICE candidates |
 | Viewer | Answer and ICE candidates | Render offer and ICE candidates |
 
-The protocol uses ordinary HTTP requests for outbound messages and Server-Sent Events (SSE) for inbound messages. It does not use WebSocket. SDP descriptions and ICE candidates are treated as opaque strings by the signaling server.
+The protocol uses ordinary HTTP requests for outbound messages and Server-Sent Events (SSE) for inbound messages. It does not use WebSocket. SDP descriptions and ICE candidate fields are transported without interpretation by the signaling server. The server produces SSE responses with the .NET 10 `TypedResults.ServerSentEvents` API and represents events as `SseItem<SignalEvent>` values.
+
+The Viewer implementation creates a real `RTCPeerConnection` and a local data channel named `viewer-data`. Render offers must include an `application` media section for an SCTP data channel. Render may also create its own data channels; the Viewer accepts them through the browser's `datachannel` event.
 
 All endpoints are relative to the server origin and use the `/api/signaling` prefix.
 
@@ -39,7 +41,10 @@ POST /api/signaling/render/ice
 Content-Type: application/json
 
 {
-  "candidate": "candidate:render-1 1 udp ..."
+  "candidate": "candidate:render-1 1 udp ...",
+  "sdpMid": "0",
+  "sdpMLineIndex": 0,
+  "usernameFragment": "render-ufrag"
 }
 ```
 
@@ -91,11 +96,34 @@ POST /api/signaling/viewer/ice
 Content-Type: application/json
 
 {
-  "candidate": "candidate:viewer-1 1 udp ..."
+  "candidate": "candidate:viewer-1 1 udp ...",
+  "sdpMid": "0",
+  "sdpMLineIndex": 0,
+  "usernameFragment": "viewer-ufrag"
 }
 ```
 
 A successful request returns `204 No Content`. The candidate is delivered to the Render SSE stream.
+
+ICE request objects follow the relevant fields from `RTCIceCandidateInit`:
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `candidate` | string | Yes | ICE candidate attribute without the `a=` prefix |
+| `sdpMid` | string or null | Yes | Media section identifier associated with the candidate |
+| `sdpMLineIndex` | integer or null | Yes | Zero-based media section index associated with the candidate |
+| `usernameFragment` | string or null | Yes | ICE username fragment, when exposed by the WebRTC implementation |
+
+An empty `candidate` string signals end-of-candidates. Its other fields may be `null`:
+
+```json
+{
+  "candidate": "",
+  "sdpMid": null,
+  "sdpMLineIndex": null,
+  "usernameFragment": null
+}
+```
 
 ## SSE Event Format
 
@@ -104,7 +132,7 @@ Both SSE endpoints use the same wire format:
 ```text
 id: 12
 event: signal
-data: {"sequence":12,"type":"ice","sender":"render","payload":"candidate:render-1 1 udp ...","createdAt":"2026-07-18T12:00:00+00:00"}
+data: {"sequence":12,"type":"ice","sender":"render","ice":{"candidate":"candidate:render-1 1 udp ...","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"render-ufrag"},"createdAt":"2026-07-18T12:00:00+00:00"}
 
 ```
 
@@ -115,7 +143,8 @@ The `data` field is a JSON object with these properties:
 | `sequence` | integer | Monotonically increasing server event identifier |
 | `type` | string | `offer`, `answer`, or `ice` |
 | `sender` | string | `render` or `viewer` |
-| `payload` | string | SDP text or an ICE candidate |
+| `sdp` | string | Present only for `offer` and `answer` events |
+| `ice` | object | Present only for `ice` events; contains the complete ICE request object |
 | `createdAt` | string | UTC timestamp in ISO 8601 format |
 
 The SSE event name is always `signal`.
@@ -124,14 +153,18 @@ The SSE event name is always `signal`.
 
 1. Render opens `GET /api/signaling/render/events` and keeps the SSE connection open.
 2. Viewer opens `GET /api/signaling/viewer/events` and keeps the SSE connection open.
-3. Render sends an offer with `POST /api/signaling/render/offer`.
-4. Viewer receives the `offer` event from its SSE stream.
-5. Viewer sends an answer with `POST /api/signaling/viewer/answer`.
-6. Render receives the `answer` event from its SSE stream.
-7. Render and Viewer send ICE candidates through their respective HTTP endpoints.
-8. Each role receives only the other role's ICE candidates from its own SSE stream.
+3. Render creates a peer connection and at least one data channel before creating its offer. This ensures the offer contains an SCTP `application` media section.
+4. Render sends the offer with `POST /api/signaling/render/offer`.
+5. Viewer receives the `offer` event from its SSE stream and applies it as the remote description.
+6. Viewer creates an answer, applies it as the local description, and sends it with `POST /api/signaling/viewer/answer`.
+7. Render receives the `answer` event from its SSE stream and applies it as the remote description.
+8. Render and Viewer send complete ICE candidate objects through their respective HTTP endpoints.
+9. Each role receives only the other role's ICE candidates from its own SSE stream and passes them to `RTCPeerConnection.addIceCandidate()`.
+10. The data channel becomes usable after the ICE/DTLS/SCTP connection is established and its `open` event fires.
 
 The two SSE connections may be opened before or after messages are posted. Buffered events are replayed when a client connects.
+
+Trickle ICE can arrive before a peer has applied the remote SDP description. Each peer must queue such candidates and call `addIceCandidate()` only after `setRemoteDescription()` succeeds. The bundled Viewer implements this queue.
 
 ## Reconnection and Replay
 
@@ -145,7 +178,7 @@ GET /api/signaling/viewer/events?after=12
 
 When both are present, the `after` query parameter takes precedence over `Last-Event-ID`.
 
-The server sends this SSE retry directive when a connection is established:
+Each emitted event includes this SSE retry directive:
 
 ```text
 retry: 1000
@@ -160,4 +193,5 @@ It asks compatible clients to wait approximately one second before reconnecting.
 - A new Render offer replaces the buffered state from the previous negotiation.
 - Events are stored only in server memory and are lost when the process restarts.
 - There is currently no authentication, authorization, payload size limit, or schema-level SDP/ICE validation.
-- The server transports signaling text only; it does not create or manage WebRTC peer connections.
+- The server transports signaling data only; it does not create or manage WebRTC peer connections.
+- The bundled Viewer uses the browser's real `RTCPeerConnection`; the Render peer must provide a compatible WebRTC implementation.

@@ -19,6 +19,7 @@ target("render")
         webrtc_root .. "/third_party/abseil-cpp"
     )
     add_includedirs(
+        "third_party/httplib",
         "third_party/metal-cpp"
     )
     add_frameworks("Foundation", "Metal")

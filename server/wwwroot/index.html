@@ -1,13 +1,16 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Viewer Signaling Peer</title>
+  <title>Viewer WebRTC Peer</title>
   <style>
     body { max-width: 900px; margin: 32px auto; padding: 0 16px; font: 15px/1.6 ui-monospace, monospace; background: #111; color: #ddd; }
     h1 { font-size: 20px; }
     #status { color: #8fd; }
+    #controls { display: flex; gap: 8px; margin-top: 16px; }
+    #message { flex: 1; min-width: 0; padding: 8px; font: inherit; }
+    #send { padding: 8px 12px; font: inherit; cursor: pointer; }
     #log { margin-top: 20px; padding: 16px; min-height: 360px; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid #555; background: #080808; }
     .render { color: #8cf; }
     .viewer { color: #fc8; }
@@ -15,13 +18,26 @@
   </style>
 </head>
 <body>
-  <h1>Viewer Signaling Peer (no WebRTC, no WebSocket)</h1>
+  <h1>Viewer WebRTC Peer (HTTP + SSE signaling)</h1>
   <div id="status">Connecting to SSE...</div>
+  <div id="controls">
+    <input id="message" type="text" placeholder="Data channel message" autocomplete="off">
+    <button id="send" disabled>Send</button>
+  </div>
   <div id="log" aria-live="polite"></div>
 
   <script>
     const logBox = document.querySelector('#log');
     const statusBox = document.querySelector('#status');
+    const messageBox = document.querySelector('#message');
+    const sendButton = document.querySelector('#send');
+
+    let peerConnection;
+    let viewerDataChannel;
+    let pendingRemoteIce = [];
+    let pendingLocalIce = [];
+    let answerSent = false;
+    let signalingQueue = Promise.resolve();
 
     function log(sender, message) {
       const line = document.createElement('div');
@@ -40,39 +56,144 @@
       if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
     }
 
+    function wireDataChannel(channel, owner) {
+      channel.addEventListener('open', () => {
+        log(owner, `Data channel "${channel.label}" opened`);
+        if (channel === viewerDataChannel) sendButton.disabled = false;
+      });
+      channel.addEventListener('close', () => {
+        log(owner, `Data channel "${channel.label}" closed`);
+        if (channel === viewerDataChannel) sendButton.disabled = true;
+      });
+      channel.addEventListener('error', event => {
+        log(owner, `Data channel "${channel.label}" error: ${event.error?.message ?? 'unknown error'}`);
+      });
+      channel.addEventListener('message', event => {
+        log(owner, `MESSAGE ← ${event.data}`);
+      });
+    }
+
+    function createPeerConnection() {
+      if (peerConnection) peerConnection.close();
+
+      pendingRemoteIce = [];
+      pendingLocalIce = [];
+      answerSent = false;
+      sendButton.disabled = true;
+      const connection = new RTCPeerConnection();
+      peerConnection = connection;
+
+      connection.addEventListener('connectionstatechange', () => {
+        statusBox.textContent = `Peer connection: ${connection.connectionState}`;
+        log('system', `Connection state: ${connection.connectionState}`);
+      });
+      connection.addEventListener('iceconnectionstatechange', () => {
+        log('system', `ICE connection state: ${connection.iceConnectionState}`);
+      });
+      connection.addEventListener('icegatheringstatechange', () => {
+        log('system', `ICE gathering state: ${connection.iceGatheringState}`);
+      });
+      connection.addEventListener('datachannel', event => {
+        log('render', `Remote data channel "${event.channel.label}" received`);
+        wireDataChannel(event.channel, 'render');
+      });
+      connection.addEventListener('icecandidate', event => {
+        if (connection !== peerConnection) return;
+
+        const candidate = event.candidate;
+        const message = candidate
+          ? {
+              candidate: candidate.candidate,
+              sdpMid: candidate.sdpMid,
+              sdpMLineIndex: candidate.sdpMLineIndex,
+              usernameFragment: candidate.usernameFragment
+            }
+          : {
+              candidate: '',
+              sdpMid: null,
+              sdpMLineIndex: null,
+              usernameFragment: null
+            };
+
+        if (answerSent) sendViewerIce(message);
+        else pendingLocalIce.push(message);
+      });
+
+      viewerDataChannel = connection.createDataChannel('viewer-data', { ordered: true });
+      wireDataChannel(viewerDataChannel, 'viewer');
+      log('viewer', 'Created RTCPeerConnection and local data channel "viewer-data"');
+    }
+
+    async function sendViewerIce(ice) {
+      try {
+        await post('/api/signaling/viewer/ice', ice);
+        log('viewer', ice.candidate ? `ICE → ${ice.candidate}` : 'ICE gathering complete');
+      } catch (error) {
+        log('system', `Failed to send Viewer ICE: ${error.message}`);
+      }
+    }
+
+    async function addRemoteIce(ice) {
+      if (!peerConnection.remoteDescription) {
+        pendingRemoteIce.push(ice);
+        return;
+      }
+
+      await peerConnection.addIceCandidate(ice);
+      log('render', ice.candidate ? `Applied ICE ← ${ice.candidate}` : 'Applied end-of-candidates');
+    }
+
+    async function handleSignal(event) {
+      if (event.type === 'offer' && event.sender === 'render') {
+        createPeerConnection();
+        statusBox.textContent = 'Applying Render offer...';
+        log('render', `OFFER ← ${event.sdp}`);
+
+        await peerConnection.setRemoteDescription({ type: 'offer', sdp: event.sdp });
+        for (const ice of pendingRemoteIce.splice(0)) await addRemoteIce(ice);
+
+        const answer = await peerConnection.createAnswer();
+        await peerConnection.setLocalDescription(answer);
+        await post('/api/signaling/viewer/answer', { sdp: peerConnection.localDescription.sdp });
+        answerSent = true;
+        log('viewer', `ANSWER → ${peerConnection.localDescription.sdp}`);
+        for (const ice of pendingLocalIce.splice(0)) await sendViewerIce(ice);
+        statusBox.textContent = 'Answer sent. Exchanging ICE.';
+        return;
+      }
+
+      if (event.type === 'ice' && event.sender === 'render') {
+        await addRemoteIce(event.ice);
+      }
+    }
+
+    sendButton.addEventListener('click', () => {
+      const message = messageBox.value;
+      if (!message || viewerDataChannel?.readyState !== 'open') return;
+      viewerDataChannel.send(message);
+      log('viewer', `MESSAGE → ${message}`);
+      messageBox.value = '';
+    });
+    messageBox.addEventListener('keydown', event => {
+      if (event.key === 'Enter') sendButton.click();
+    });
+
+    createPeerConnection();
     const eventSource = new EventSource('/api/signaling/viewer/events');
 
     eventSource.onopen = () => {
       statusBox.textContent = 'SSE connected. Waiting for Render offer/ICE.';
-      log('system', 'Connected to viewer SSE: GET /api/signaling/viewer/events');
+      log('system', 'Connected to Viewer SSE: GET /api/signaling/viewer/events');
     };
 
-    eventSource.addEventListener('signal', async message => {
-      try {
-        const event = JSON.parse(message.data);
-        log(event.sender, `${event.type.toUpperCase()} → ${event.payload}`);
-
-        if (event.type === 'offer' && event.sender === 'render') {
-          statusBox.textContent = 'Offer received. Sending answer/ICE.';
-
-          const sdp = 'v=0\r\no=viewer 1 1 IN IP4 127.0.0.1\r\ns=mock-answer\r\nt=0 0';
-          await post('/api/signaling/viewer/answer', { sdp });
-          log('viewer', `ANSWER → ${sdp}`);
-
-          for (const candidate of [
-            'candidate:viewer-1 1 udp 2122260223 192.0.2.2 50001 typ host',
-            'candidate:viewer-2 1 udp 1686052607 198.51.100.2 3479 typ srflx'
-          ]) {
-            await post('/api/signaling/viewer/ice', { candidate });
-            log('viewer', `ICE → ${candidate}`);
-          }
-
-          statusBox.textContent = 'Answer/ICE sent. Waiting for more Render ICE.';
-        }
-      } catch (error) {
-        log('system', `Failed to process signaling event: ${error.message}`);
-        statusBox.textContent = 'Signaling failed.';
-      }
+    eventSource.addEventListener('signal', message => {
+      const event = JSON.parse(message.data);
+      signalingQueue = signalingQueue
+        .then(() => handleSignal(event))
+        .catch(error => {
+          log('system', `Failed to process signaling event: ${error.message}`);
+          statusBox.textContent = 'Signaling failed.';
+        });
     });
 
     eventSource.onerror = () => {

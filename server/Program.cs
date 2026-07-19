@@ -1,4 +1,5 @@
-using System.Text.Json;
+using System.Net.ServerSentEvents;
+using System.Runtime.CompilerServices;
 using System.Text.Json.Serialization;
 
 Console.WriteLine("Starting fixed-role HTTP/SSE signaling server...");
@@ -17,54 +18,52 @@ app.UseStaticFiles();
 
 var signaling = app.MapGroup("/api/signaling");
 
-// Render sends offer and ICE messages to the viewer over HTTP.
+// Render sends offer and ICE messages to the Viewer over HTTP.
 signaling.MapPost("/render/offer", (SdpRequest request) =>
 {
     hub.BeginOffer(request.Sdp);
-    Log("render", "sent offer", request.Sdp);
+    LogDescription("render", "sent offer", request.Sdp);
     return Results.NoContent();
 });
 
-signaling.MapPost("/render/ice", (IceCandidateRequest request) =>
+signaling.MapPost("/render/ice", (IceCandidateMessage request) =>
 {
-    hub.SendToViewer("ice", "render", request.Candidate);
-    Log("render", "sent ICE", request.Candidate);
+    hub.SendIceToViewer(request);
+    LogIce("render", request);
     return Results.NoContent();
 });
 
-// Render receives only viewer answer and ICE messages from this SSE stream.
+// Render receives only Viewer answer and ICE messages from this SSE stream.
 signaling.MapGet("/render/events", (HttpContext context, long? after) =>
-    StreamEvents(context, after, hub.WaitForRenderEventsAfterAsync));
+    CreateEventStream(context, after, hub.WaitForRenderEventsAfterAsync));
 
 // Viewer sends answer and ICE messages to Render over HTTP.
 signaling.MapPost("/viewer/answer", (SdpRequest request) =>
 {
-    hub.SendToRender("answer", "viewer", request.Sdp);
-    Log("viewer", "sent answer", request.Sdp);
+    hub.SendAnswerToRender(request.Sdp);
+    LogDescription("viewer", "sent answer", request.Sdp);
     return Results.NoContent();
 });
 
-signaling.MapPost("/viewer/ice", (IceCandidateRequest request) =>
+signaling.MapPost("/viewer/ice", (IceCandidateMessage request) =>
 {
-    hub.SendToRender("ice", "viewer", request.Candidate);
-    Log("viewer", "sent ICE", request.Candidate);
+    hub.SendIceToRender(request);
+    LogIce("viewer", request);
     return Results.NoContent();
 });
 
 // Viewer receives only Render offer and ICE messages from this SSE stream.
 signaling.MapGet("/viewer/events", (HttpContext context, long? after) =>
-    StreamEvents(context, after, hub.WaitForViewerEventsAfterAsync));
+    CreateEventStream(context, after, hub.WaitForViewerEventsAfterAsync));
 
 app.Run();
 
-static async Task StreamEvents(
+static IResult CreateEventStream(
     HttpContext context,
     long? after,
     Func<long, CancellationToken, Task<SignalEvent[]>> waitForEvents)
 {
-    context.Response.Headers.CacheControl = "no-cache";
     context.Response.Headers.Append("X-Accel-Buffering", "no");
-    context.Response.ContentType = "text/event-stream";
 
     var lastSequence = after ?? 0;
     if (after is null && long.TryParse(context.Request.Headers["Last-Event-ID"], out var lastEventId))
@@ -72,39 +71,56 @@ static async Task StreamEvents(
         lastSequence = lastEventId;
     }
 
-    await context.Response.WriteAsync("retry: 1000\n\n", context.RequestAborted);
-    await context.Response.Body.FlushAsync(context.RequestAborted);
+    return TypedResults.ServerSentEvents(
+        ReadEvents(lastSequence, waitForEvents, context.RequestAborted));
+}
 
-    try
+static async IAsyncEnumerable<SseItem<SignalEvent>> ReadEvents(
+    long lastSequence,
+    Func<long, CancellationToken, Task<SignalEvent[]>> waitForEvents,
+    [EnumeratorCancellation] CancellationToken cancellationToken)
+{
+    while (!cancellationToken.IsCancellationRequested)
     {
-        while (!context.RequestAborted.IsCancellationRequested)
+        SignalEvent[] events;
+        try
         {
-            var events = await waitForEvents(lastSequence, context.RequestAborted);
-            foreach (var signalEvent in events)
-            {
-                var json = JsonSerializer.Serialize(signalEvent, AppJsonSerializerContext.Default.SignalEvent);
-                await context.Response.WriteAsync(
-                    $"id: {signalEvent.Sequence}\nevent: signal\ndata: {json}\n\n",
-                    context.RequestAborted);
-                lastSequence = signalEvent.Sequence;
-            }
-
-            await context.Response.Body.FlushAsync(context.RequestAborted);
+            events = await waitForEvents(lastSequence, cancellationToken);
         }
-    }
-    catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
-    {
-        // End normally when the SSE client disconnects.
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            yield break;
+        }
+
+        foreach (var signalEvent in events)
+        {
+            yield return new SseItem<SignalEvent>(signalEvent, "signal")
+            {
+                EventId = signalEvent.Sequence.ToString(),
+                ReconnectionInterval = TimeSpan.FromSeconds(1)
+            };
+            lastSequence = signalEvent.Sequence;
+        }
     }
 }
 
-static void Log(string sender, string action, string payload) =>
+static void LogDescription(string sender, string action, string sdp) =>
     Console.WriteLine(
         "[{0:HH:mm:ss}] [{1}] {2}: {3}",
         DateTimeOffset.Now,
         sender,
         action,
-        payload.Replace("\r", "").Replace("\n", " | "));
+        sdp.Replace("\r", "").Replace("\n", " | "));
+
+static void LogIce(string sender, IceCandidateMessage ice) =>
+    Console.WriteLine(
+        "[{0:HH:mm:ss}] [{1}] sent ICE: candidate={2}, sdpMid={3}, sdpMLineIndex={4}, usernameFragment={5}",
+        DateTimeOffset.Now,
+        sender,
+        ice.Candidate,
+        ice.SdpMid,
+        ice.SdpMLineIndex,
+        ice.UsernameFragment);
 
 public sealed class SignalingHub
 {
@@ -125,7 +141,7 @@ public sealed class SignalingHub
             // Only one Render-to-Viewer pair is supported. A new offer starts a new negotiation.
             viewerEvents.Clear();
             renderEvents.Clear();
-            viewerEvents.Add(new SignalEvent(++sequence, "offer", "render", sdp, DateTimeOffset.UtcNow));
+            viewerEvents.Add(NewEvent("offer", "render", sdp, null));
 
             viewerChanged = viewerEventsChanged;
             renderChanged = renderEventsChanged;
@@ -137,11 +153,14 @@ public sealed class SignalingHub
         renderChanged.TrySetResult();
     }
 
-    public void SendToViewer(string type, string sender, string payload) =>
-        Add(viewerEvents, ref viewerEventsChanged, type, sender, payload);
+    public void SendIceToViewer(IceCandidateMessage ice) =>
+        Add(viewerEvents, ref viewerEventsChanged, "ice", "render", null, ice);
 
-    public void SendToRender(string type, string sender, string payload) =>
-        Add(renderEvents, ref renderEventsChanged, type, sender, payload);
+    public void SendAnswerToRender(string sdp) =>
+        Add(renderEvents, ref renderEventsChanged, "answer", "viewer", sdp, null);
+
+    public void SendIceToRender(IceCandidateMessage ice) =>
+        Add(renderEvents, ref renderEventsChanged, "ice", "viewer", null, ice);
 
     public Task<SignalEvent[]> WaitForViewerEventsAfterAsync(long after, CancellationToken cancellationToken) =>
         WaitForEventsAfterAsync(viewerEvents, () => viewerEventsChanged.Task, after, cancellationToken);
@@ -154,18 +173,22 @@ public sealed class SignalingHub
         ref TaskCompletionSource eventsChanged,
         string type,
         string sender,
-        string payload)
+        string? sdp,
+        IceCandidateMessage? ice)
     {
         TaskCompletionSource changed;
         lock (gate)
         {
-            destination.Add(new SignalEvent(++sequence, type, sender, payload, DateTimeOffset.UtcNow));
+            destination.Add(NewEvent(type, sender, sdp, ice));
             changed = eventsChanged;
             eventsChanged = NewEventsChangedSource();
         }
 
         changed.TrySetResult();
     }
+
+    private SignalEvent NewEvent(string type, string sender, string? sdp, IceCandidateMessage? ice) =>
+        new(++sequence, type, sender, sdp, ice, DateTimeOffset.UtcNow);
 
     private async Task<SignalEvent[]> WaitForEventsAfterAsync(
         List<SignalEvent> source,
@@ -196,11 +219,25 @@ public sealed class SignalingHub
 }
 
 public sealed record SdpRequest(string Sdp);
-public sealed record IceCandidateRequest(string Candidate);
-public sealed record SignalEvent(long Sequence, string Type, string Sender, string Payload, DateTimeOffset CreatedAt);
 
-[JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
+public sealed record IceCandidateMessage(
+    string Candidate,
+    string? SdpMid,
+    int? SdpMLineIndex,
+    string? UsernameFragment);
+
+public sealed record SignalEvent(
+    long Sequence,
+    string Type,
+    string Sender,
+    string? Sdp,
+    IceCandidateMessage? Ice,
+    DateTimeOffset CreatedAt);
+
+[JsonSourceGenerationOptions(
+    PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
+    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
 [JsonSerializable(typeof(SdpRequest))]
-[JsonSerializable(typeof(IceCandidateRequest))]
+[JsonSerializable(typeof(IceCandidateMessage))]
 [JsonSerializable(typeof(SignalEvent))]
 internal partial class AppJsonSerializerContext : JsonSerializerContext;

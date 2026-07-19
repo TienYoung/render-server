@@ -17,7 +17,10 @@ POST {{server_HostAddress}}/api/signaling/render/ice
 Content-Type: application/json
 
 {
-  "candidate": "candidate:render-1 1 udp 2122260223 192.0.2.1 50000 typ host"
+  "candidate": "candidate:render-1 1 udp 2122260223 192.0.2.1 50000 typ host",
+  "sdpMid": "0",
+  "sdpMLineIndex": 0,
+  "usernameFragment": "render-ufrag"
 }
 
 ### Viewer: open this SSE stream and wait for Render offer/ICE
@@ -37,5 +40,8 @@ POST {{server_HostAddress}}/api/signaling/viewer/ice
 Content-Type: application/json
 
 {
-  "candidate": "candidate:viewer-1 1 udp 2122260223 192.0.2.2 50001 typ host"
+  "candidate": "candidate:viewer-1 1 udp 2122260223 192.0.2.2 50001 typ host",
+  "sdpMid": "0",
+  "sdpMLineIndex": 0,
+  "usernameFragment": "viewer-ufrag"
 }

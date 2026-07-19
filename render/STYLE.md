@@ -38,13 +38,7 @@ For example, WebRTC observer overrides remain `OnIceCandidate()` even though
 project-owned methods use `snake_case`. Third-party types and enum values also
 retain their upstream names.
 
-## Enforcement
+## Application
 
-`.clang-format` controls layout only. `.clang-tidy` contains the enforceable
-identifier rules. Run the naming check with the compilation database generated
-by xmake:
-
-```sh
-clang-tidy -p . src/*.cpp
-```
-
+`.clang-format` controls layout. Naming is kept consistent through this guide
+and code review; the project does not require a separate naming linter.
